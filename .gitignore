@@ -95,4 +95,4 @@ wandb/
 .DS_Store
 Notebooks/
 *.jpg
-data/
+dataset/
