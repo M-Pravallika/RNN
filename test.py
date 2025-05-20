@@ -1,3 +1,6 @@
+
+import matplotlib.pyplot as plt
+import seaborn as sns
 from __future__ import unicode_literals, print_function, division
 from io import open
 import csv
@@ -237,9 +240,9 @@ def parseArguments():
     p.add_argument('-t', '--type', help="Apply attention or not, choices: [Vanilla, Attention]", type=str, default='Vanilla')
     p.add_argument('-e', '--noOfEpochs', help="Max number of epochs to run", type=int, default=1)
     p.add_argument('-c', '--cellType', help="Type of cell choices: [GRU, RNN, LSTM]", type=str, default='GRU')
-    p.add_argument('-n', '--noOfLayers', help="Number of layers: [1, 2, 3]", type=int, default=1)
-    p.add_argument('-hs', '--hidden_size', help="Hidden cell size", type=int, default=128)
-    p.add_argument('-es', '--embedding_size', help="Embedding size", type=int, default=256)
+    p.add_argument('-n', '--noOfLayers', help="Number of layers: [1, 2, 3]", type=int, default=3)
+    p.add_argument('-hs', '--hidden_size', help="Hidden cell size", type=int, default=256)
+    p.add_argument('-es', '--embedding_size', help="Embedding size", type=int, default=512)
     p.add_argument('-b', '--batch_size', help="Batch size", type=int, default=32)
     p.add_argument('-o', '--optimizer', help="Optimizer to be used [RMSprop, Adam, NAdam]", type=str, default='RMSprop')
     p.add_argument('-lr', '--eta', help="Learning rate", type=float, default=0.001)
@@ -356,73 +359,52 @@ def evaluate(encoder, decoder, word, inputLang, outputLang, device):
         
     return decodedWord, attentions
 
-def train_test_model(args):
-    print(args)
-    params = {
-        "architecture": args.type,
-        "num_epochs": args.noOfEpochs,
-        "cell_type": args.cellType,
-        "num_layers": args.noOfLayers,
-        "hidden_layer_size": args.hidden_size,
-        "embedding_size": args.embedding_size,
-        "activation_fn": args.activation,
-        "dropout": args.dropout,
-        "eta": args.eta,
-        "optim": args.optimizer,
-        "batch_size": args.batch_size
-    }
+def load_model(checkpoint_path, use_attention=True):
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    params = checkpoint['params']
+    input_lang = checkpoint['input_lang']
+    output_lang = checkpoint['output_lang']
+    
+    encoder = Encoder(input_lang.total_tokens, params)
+    decoder_class = AttentionDecoder if use_attention else Decoder
+    decoder = decoder_class(params, output_lang.total_tokens)
+    
+    encoder.load_state_dict(checkpoint['encoder_state_dict'])
+    decoder.load_state_dict(checkpoint['decoder_state_dict'])
+    
+    device = params["device"]
+    encoder.to(device)
+    decoder.to(device)
+    encoder.eval()
+    decoder.eval()
 
-    additional_config = {
-        "max_length": 25
-    }
+    return encoder, decoder, input_lang, output_lang, device
 
-    with wandb.init(config = params, project=args.wandb_project):
-        params = wandb.config
 
-        # Select device dynamically
-        gpu_available = torch.cuda.is_available()
-        mps_available = torch.backends.mps.is_built()
-        device = "mps" if mps_available else "cuda" if gpu_available else "cpu"
-        print("Running on device: " + device)
-        additional_config["device"] = device
+def visualize_attention(input_word, output_word, attention_weights):
+    attention = attention_weights.squeeze(0).cpu().detach().numpy()  # shape: [output_len, input_len]
+    input_chars = list(input_word) + ['<EOS>']
+    output_chars = list(output_word)
 
-        params.update(additional_config)
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(attention[:len(output_chars), :len(input_chars)], 
+                xticklabels=input_chars, 
+                yticklabels=output_chars,
+                cmap='viridis', cbar=True, linewidths=0.5)
 
-        run_name_template = "{} / cellType {} / #layers {} / hiddenSize {} / embedSize {} / actFn {} / dropout {} / learnRate {} / optim {} / batch_size {}"
-        run_name = run_name_template.format(params["architecture"], params["cell_type"],
-                                            params["num_layers"], params["hidden_layer_size"],
-                                            params["embedding_size"], params["activation_fn"],
-                                            params["dropout"], params["eta"], params["optim"],
-                                            params["batch_size"])
+    plt.xlabel('Input')
+    plt.ylabel('Output')
+    plt.title(f'Attention Heatmap: {input_word} → {output_word}')
+    plt.show()
 
-        print("Run name: ", run_name)
-        wandb.run.name = run_name
-
-        # Load the data
-        langDataLoader = LangDataLoader(args.lang, params, args.folder, 'train')
-        input_lang, output_lang, train_dataloader = langDataLoader.get_data_loader()
-
-        # Create encoder and decoder based on architecture
-        encoder = Encoder(input_lang.total_tokens, params).to(device)
-        if params["architecture"] == "Attention":
-            decoder = AttentionDecoder(params, output_lang.total_tokens).to(device)
-        else:
-            decoder = Decoder(params, output_lang.total_tokens).to(device)
-
-        # Train the model and check validation accuracy
-        train(train_dataloader, encoder, decoder, params, input_lang, output_lang, args.folder)
-        testAccuracy = evaluateData(encoder, decoder, input_lang, output_lang, output_lang.name, 'test', args.folder, device, True)
-        print('Test Accuracy: %.4f' % (testAccuracy))
-        wandb.log({"accuracy": testAccuracy})
-        return encoder, decoder, input_lang, output_lang, device
+def test_custom_inputs(encoder, decoder, input_lang, output_lang, device, words):
+    for word in words:
+        prediction, attention = evaluate(encoder, decoder, word, input_lang, output_lang, device)
+        print(f"Input: {word} → Prediction: {prediction}")
+        if attention is not None:
+            visualize_attention(word, prediction, attention)
 
 if __name__ == "__main__":
-    args = parseArguments()
-    encoder, decoder, input_lang, output_lang, device = train_test_model(args)
-    torch.save({
-        'encoder_state_dict': encoder.state_dict(),
-        'decoder_state_dict': decoder.state_dict(),
-        'input_lang': input_lang,
-        'output_lang': output_lang
-    }, 'model_checkpoint.pt')
-    wandb.finish()
+    encoder, decoder, input_lang, output_lang, device = load_model('model_checkpoint.pt', use_attention=True)
+    custom_words = ['iqbal', 'murgipaalan', 'capacitor', 'spinj']
+    test_custom_inputs(encoder, decoder, input_lang, output_lang, device, custom_words)
